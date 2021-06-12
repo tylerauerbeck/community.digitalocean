@@ -99,35 +99,67 @@ options:
     suboptions:
       protocol:
         description:
-        type:
-        required:
+          - Protocol used to send health checks to backend droplets
+          - Options are C(http), C(https), or C(tcp)
+        type: str
+        choices: ['http','https','tcp']
+        required: true
       port:
         description:
-        type:
-        required:
+          - Port used to connect for health checks on backend droplets
+        type: int
+        required: true
       path:
         description:
-        type:
+          - The path on the backend droplet which health check requests are sent
+        type: str
+        default: "/"
       check_interval_seconds:
         description:
-        type:
+          - The number of seconds between two consecutive health checks
+        type: int
+        default: 10
       response_timeout_seconds:
         description:
-        type:
+          - The number of seconds a health check will wait before considering it failed
+          - Must be between 3 and 300
+        default: 5
+        type: int
       unhealthy_threshold:
         description:
-        type:
+          - The number of times a health check must fail before a backend droplet will be considered unhealthy
+          - Must be between 2 and 10
+        default: 3
+        type: int
       healthy_threshold:
         description:
-        type:
+          - The number of times a health check must pass before a backend droplet will be considered healthy
+          - Must be between 2 and 10
+        default: 5
+        type: int
   sticky_sessions:
     description:
-      - TODO
-    type: list
-    elements: dict
+      - Configuration specifying how sticky sessions should be used by the load balancer
+    type: dict
     suboptions:
-      - TODO
-  unsecure_redirect:
+      type:
+        description:
+          - Indicates how and if requests from a client will be persistently served by the same backend droplet 
+          - Options are C(cookies) or C(none)
+        type: str
+        choices: ["cookies","none"]
+        default: "none"
+      cookie_name:
+        description:
+          - The name to be used for the cookie sent to the client.
+          - This is required when type is C(cookie)
+        type: str
+        #TODO: Need to tie cookie_name and type together
+      cookie_ttl_seconds:
+        description:
+          - Number of seconds until the cookie set by the load balancer expires 
+          - This is required when type is C(cookie)
+  redirect_http_to_https:
     description:
       - Whether to redirect http requests to https
       - Requests to the load balancer on port 80 will be redirected to 443
@@ -176,278 +208,159 @@ from ansible.module_utils.basic import AnsibleModule, env_fallback
 from ansible_collections.community.digitalocean.plugins.module_utils.digital_ocean import DigitalOceanHelper
 
 
-class DODroplet(object):
+class DOLoadBalancer(object):
     def __init__(self, module):
         self.rest = DigitalOceanHelper(module)
         self.module = module
-        self.wait = self.module.params.pop('wait', True)
-        self.wait_timeout = self.module.params.pop('wait_timeout', 120)
-        self.unique_name = self.module.params.pop('unique_name', False)
+#        self.wait = self.module.params.pop('wait', True)
+#        self.wait_timeout = self.module.params.pop('wait_timeout', 120)
         # pop the oauth token so we don't include it in the POST data
         self.module.params.pop('oauth_token')
         self.id = None
         self.name = None
-        self.size = None
-        self.status = None
 
-    def get_by_id(self, droplet_id):
-        if not droplet_id:
+    def get_by_id(self, lb_id):
+        if not lb_id:
             return None
-        response = self.rest.get('droplets/{0}'.format(droplet_id))
+        response = self.rest.get('load_balancers/{0}'.format(lb_id))
         json_data = response.json
         if response.status_code == 200:
-            droplet = json_data.get('droplet', None)
-            if droplet is not None:
-                self.id = droplet.get('id', None)
-                self.name = droplet.get('name', None)
-                self.size = droplet.get('size_slug', None)
-                self.status = droplet.get('status', None)
+            lb = json_data.get('load_balancer', None)
+            if lb is not None:
+                self.id = lb.get('id', None)
+                self.name = lb.get('name', None)
+                self.size = lb.get('size', None)
             return json_data
         return None
 
-    def get_by_name(self, droplet_name):
-        if not droplet_name:
+    def get_by_name(self, lb_name):
+        if not lb_name:
             return None
         page = 1
         while page is not None:
-            response = self.rest.get('droplets?page={0}'.format(page))
+            response = self.rest.get('load_balancers?page={0}'.format(page))
             json_data = response.json
             if response.status_code == 200:
-                for droplet in json_data['droplets']:
-                    if droplet.get('name', None) == droplet_name:
-                        self.id = droplet.get('id', None)
-                        self.name = droplet.get('name', None)
-                        self.size = droplet.get('size_slug', None)
-                        self.status = droplet.get('status', None)
-                        return {'droplet': droplet}
+                for lb in json_data['load_balancers']:
+                    if lb.get('name', None) == lb_name:
+                        self.id = lb.get('id', None)
+                        self.name = lb.get('name', None)
+                        self.size = lb.get('size', None)
+                        return {'load_balancer': lb}
                 if 'links' in json_data and 'pages' in json_data['links'] and 'next' in json_data['links']['pages']:
                     page += 1
                 else:
                     page = None
         return None
 
-    def get_addresses(self, data):
-        """Expose IP addresses as their own property allowing users extend to additional tasks"""
-        _data = data
-        for k, v in data.items():
-            setattr(self, k, v)
-        networks = _data['droplet']['networks']
-        for network in networks.get('v4', []):
-            if network['type'] == 'public':
-                _data['ip_address'] = network['ip_address']
-            else:
-                _data['private_ipv4_address'] = network['ip_address']
-        for network in networks.get('v6', []):
-            if network['type'] == 'public':
-                _data['ipv6_address'] = network['ip_address']
-            else:
-                _data['private_ipv6_address'] = network['ip_address']
-        return _data
-
-    def get_droplet(self):
+    def get_lb(self):
         json_data = self.get_by_id(self.module.params['id'])
-        if not json_data and self.unique_name:
+        if not json_data:
             json_data = self.get_by_name(self.module.params['name'])
         return json_data
 
-    def resize_droplet(self):
-        """API reference: https://developers.digitalocean.com/documentation/v2/#resize-a-droplet (Must be powered off)"""
-        if self.status == 'off':
-            response = self.rest.post('droplets/{0}/actions'.format(self.id),
-                                      data={'type': 'resize', 'disk': self.module.params['resize_disk'], 'size': self.module.params['size']})
-            json_data = response.json
-            if response.status_code == 201:
-                self.module.exit_json(changed=True, msg='Resized Droplet {0} ({1}) from {2} to {3}'.format(
-                    self.name, self.id, self.size, self.module.params['size']))
-            else:
-                self.module.fail_json(msg="Resizing Droplet {0} ({1}) failed [HTTP {2}: {3}]".format(
-                    self.name, self.id, response.status_code, response.json.get('message', None)))
-        else:
-            self.module.fail_json(msg='Droplet must be off prior to resizing (https://developers.digitalocean.com/documentation/v2/#resize-a-droplet)')
-
     def create(self, state):
-        json_data = self.get_droplet()
-        droplet_data = None
-        if json_data is not None:
-            droplet = json_data.get('droplet', None)
-            if droplet is not None:
-                droplet_size = droplet.get('size_slug', None)
-                if droplet_size is not None:
-                    if droplet_size != self.module.params['size']:
-                        self.resize_droplet()
-            droplet_data = self.get_addresses(json_data)
-            # If state is active or inactive, ensure requested and desired power states match
-            droplet = json_data.get('droplet', None)
-            if droplet is not None:
-                droplet_id = droplet.get('id', None)
-                droplet_status = droplet.get('status', None)
-                if droplet_id is not None and droplet_status is not None:
-                    if state == 'active' and droplet_status != 'active':
-                        power_on_json_data = self.ensure_power_on(droplet_id)
-                        self.module.exit_json(changed=True, data=self.get_addresses(power_on_json_data))
-                    elif state == 'inactive' and droplet_status != 'off':
-                        power_off_json_data = self.ensure_power_off(droplet_id)
-                        self.module.exit_json(changed=True, data=self.get_addresses(power_off_json_data))
-                    else:
-                        self.module.exit_json(changed=False, data=droplet_data)
-        if self.module.check_mode:
-            self.module.exit_json(changed=True)
+        json_data = self.get_lb()
         request_params = dict(self.module.params)
-        del request_params['id']
-        response = self.rest.post('droplets', data=request_params)
-        json_data = response.json
-        if response.status_code >= 400:
-            self.module.fail_json(changed=False, msg=json_data['message'])
-        droplet_data = json_data.get("droplet", None)
-        if droplet_data is not None:
-            droplet_id = droplet_data.get("id", None)
-            if droplet_id is not None:
-                if self.wait:
-                    if state == "active":
-                        json_data = self.ensure_power_on(droplet_id)
-                    if state == "inactive":
-                        json_data = self.ensure_power_off(droplet_id)
-                    droplet_data = self.get_addresses(json_data)
-                else:
-                    if state == "inactive":
-                        response = self.rest.post('droplets/{0}/actions'.format(droplet_id), data={'type': 'power_off'})
-            else:
-                self.module.fail_json(changed=False, msg="Unexpected error, please file a bug")
+
+        if json_data is not None:
+            lb = json_data.get('load_balancer', None)
+            if lb is not None:
+                lb_size = lb.get('size', None)
+                if lb_size is not None:
+                    if lb_size != self.module.params['size']:
+                        self.module.fail_json(changed=False, msg="Load Balancer sizes cannot be changed after initial creation. Either create a new load-balancer or delete the existing load-balancer before proceeding.")
+                response = self.rest.put('load_balancers/{0}'.format(json_data["load_balancer"]["id"]), data=request_params)
+
+                if response.status_code != 200:
+                    self.module.fail_json(changed=False, msg=response.json)
+                self.module.exit_json(changed=True, data=response.json)
         else:
-            self.module.fail_json(changed=False, msg="Unexpected error, please file a bug")
-        self.module.exit_json(changed=True, data=droplet_data)
+            response = self.rest.post('load_balancers', data=self.module.params)  
+
+            if response.status_code != 202:
+                self.module.fail_json(changed=False, msg=response.json)
+            self.module.exit_json(changed=True, data=response.json)
 
     def delete(self):
-        json_data = self.get_droplet()
+        json_data = self.get_lb()
         if json_data:
             if self.module.check_mode:
                 self.module.exit_json(changed=True)
             response = self.rest.delete('droplets/{0}'.format(json_data['droplet']['id']))
-            json_data = response.json
             if response.status_code == 204:
-                self.module.exit_json(changed=True, msg='Droplet deleted')
-            self.module.fail_json(changed=False, msg='Failed to delete droplet')
+                self.module.exit_json(changed=True, msg='Load-balancer deleted')
+            self.module.fail_json(changed=False, msg='Failed to delete load-balancer')
         else:
-            self.module.exit_json(changed=False, msg='Droplet not found')
-
-    def ensure_power_on(self, droplet_id):
-        response = self.rest.post('droplets/{0}/actions'.format(droplet_id), data={'type': 'power_on'})
-        end_time = time.monotonic() + self.wait_timeout
-        while time.monotonic() < end_time:
-            response = self.rest.get('droplets/{0}'.format(droplet_id))
-            json_data = response.json
-            if json_data['droplet']['status'] == 'active':
-                return json_data
-            time.sleep(min(10, end_time - time.monotonic()))
-        self.module.fail_json(msg='Wait for droplet powering on timeout')
-
-    def ensure_power_off(self, droplet_id):
-
-        # Make sure Droplet is active first
-        end_time = time.monotonic() + self.wait_timeout
-        while time.monotonic() < end_time:
-            response = self.rest.get('droplets/{0}'.format(droplet_id))
-            json_data = response.json
-            if response.status_code >= 400:
-                self.module.fail_json(changed=False, msg=json_data['message'])
-
-            droplet = json_data.get("droplet", None)
-            if droplet is None:
-                self.module.fail_json(changed=False, msg="Unexpected error, please file a bug (no droplet)")
-
-            droplet_status = droplet.get("status", None)
-            if droplet_status is None:
-                self.module.fail_json(changed=False, msg="Unexpected error, please file a bug (no status)")
-
-            if droplet_status == "active":
-                break
-
-            time.sleep(min(10, end_time - time.monotonic()))
-
-        # Trigger power-off
-        response = self.rest.post('droplets/{0}/actions'.format(droplet_id), data={'type': 'power_off'})
-        json_data = response.json
-        if response.status_code >= 400:
-            self.module.fail_json(changed=False, msg=json_data['message'])
-
-        # Save the power-off action
-        action = json_data.get("action", None)
-        action_id = action.get("id", None)
-        if action is None or action_id is None:
-            self.module.fail_json(changed=False, msg="Unexpected error, please file a bug (no power-off action or id)")
-
-        # Keep checking till it is done or times out
-        end_time = time.monotonic() + self.wait_timeout
-        while time.monotonic() < end_time:
-            response = self.rest.get('droplets/{0}/actions/{1}'.format(droplet_id, action_id))
-            json_data = response.json
-            if response.status_code >= 400:
-                self.module.fail_json(changed=False, msg=json_data['message'])
-
-            action = json_data.get("action", None)
-            action_status = action.get("status", None)
-            if action is None or action_status is None:
-                self.module.fail_json(changed=False, msg="Unexpected error, please file a bug (no action or status)")
-
-            if action_status == "completed":
-                response = self.rest.get('droplets/{0}'.format(droplet_id))
-                json_data = response.json
-                if response.status_code >= 400:
-                    self.module.fail_json(changed=False, msg=json_data['message'])
-                return(json_data)
-
-            time.sleep(min(10, end_time - time.monotonic()))
-
-        self.module.fail_json(msg='Wait for droplet powering off timeout')
-
+            self.module.exit_json(changed=False, msg='Load-balancer not found')
 
 def core(module):
     state = module.params.pop('state')
-    droplet = DODroplet(module)
-    if state == 'present' or state == 'active' or state == 'inactive':
-        droplet.create(state)
+    lb = DOLoadBalancer(module)
+    if state == 'present':
+        lb.create(state)
     elif state == 'absent':
-        droplet.delete()
+        lb.delete()
 
+forwarding_rule_argspec = dict(
+    entry_protocol=dict(type='str',required=True,choices=["http","https","http2","tcp"]),
+    entry_port=dict(type='int', required=True),
+    target_protocol=dict(type='str', required=True,choices=["http","https","http2","tcp"]),
+    target_port=dict(type='int',required=True),
+    certificate_id=dict(type='str',default=""),
+    tls_passthrough=dict(type='bool',default=False),
+)
+
+sticky_argspec = dict(
+    type=dict(type='str',required=True,choices=['none','cookie']),
+    cookie_name=dict(type='str'),
+    cookie_ttl_seconds=dict(type='int'),
+    required_if=[
+        ('type','cookie', ['cookie_name',"cookie_ttl_seconds"])
+    ]
+)
+
+health_check_argspec = dict(
+    protocol=dict(type='str',required=True,choices=['http','https','tcp']),
+    port=dict(type='int',required=True),
+    path=dict(type='str',default="/"),
+    check_interval_seconds=dict(type='int',default=10),
+    response_timeout_seconds=dict(type='int',default=5),
+    unhealthy_threshold=dict(type='int',default=3),
+    healthy_threshold=dict(type='int',default=5)
+)
 
 def main():
     module = AnsibleModule(
         argument_spec=dict(
-            state=dict(choices=['present', 'absent', 'active', 'inactive'], default='present'),
+            state=dict(choices=['present', 'absent'], default='present'),
             oauth_token=dict(
                 aliases=['API_TOKEN'],
                 no_log=True,
                 fallback=(env_fallback, ['DO_API_TOKEN', 'DO_API_KEY', 'DO_OAUTH_TOKEN']),
                 required=True,
             ),
-            name=dict(type='str'),
-            size=dict(aliases=['size_id']),
-            image=dict(aliases=['image_id']),
-            region=dict(aliases=['region_id']),
-            ssh_keys=dict(type='list', elements='str', no_log=False),
-            private_networking=dict(type='bool', default=False),
+            name=dict(type='str',required=True),
+            size=dict(type='str',choices=['lb-small','lb-medium','lb-large'],default="lb-small"),
+            algorithm=dict(type='str',choices=['round_robin','least_connections'],default="round_robin"),
+            region=dict(type='str',required=True),
+            forwarding_rules=dict(type="list",elements="dict",required=True,options=forwarding_rule_argspec),
+            health_check=dict(type='dict',options=health_check_argspec),
+            redirect_http_to_https=dict(type='bool',default=False),
+            enable_proxy_protocol=dict(type='bool'),
+            enable_backend_keepalive=dict(type='bool'),
+            sticky_sessions=dict(type='dict',options=sticky_argspec),
             vpc_uuid=dict(type='str'),
-            backups=dict(type='bool', default=False),
-            monitoring=dict(type='bool', default=False),
+            droplet_ids=dict(type='list',elements='dict'),
             id=dict(aliases=['droplet_id'], type='int'),
-            user_data=dict(default=None),
-            ipv6=dict(type='bool', default=False),
-            volumes=dict(type='list', elements='str'),
-            tags=dict(type='list', elements='str'),
-            wait=dict(type='bool', default=True),
-            wait_timeout=dict(default=120, type='int'),
-            unique_name=dict(type='bool', default=False),
-            resize_disk=dict(type='bool', default=False),
         ),
         required_one_of=(
             ['id', 'name'],
         ),
-        required_if=([
-            ('state', 'present', ['name', 'size', 'image', 'region']),
-            ('state', 'active', ['name', 'size', 'image', 'region']),
-            ('state', 'inactive', ['name', 'size', 'image', 'region']),
-        ]),
-        supports_check_mode=True,
+#        required_if=([
+#            ('state', 'present', ['name', 'size', 'image', 'region']),
+#        ]),
+#        supports_check_mode=True,
     )
 
     core(module)
